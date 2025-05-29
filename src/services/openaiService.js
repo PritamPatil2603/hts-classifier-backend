@@ -14,29 +14,44 @@ const openai = new OpenAI({
 const mongodbTools = [
   {
     type: "function",
-    name: "lookup_hts_by_six_digit_base",
-    description: "Lookup all HTS codes and statistical suffixes for a given 6-digit base code from the official MongoDB database. Use this to find all possible statistical suffixes for a 6-digit HTS code.",
+    name: "lookup_by_subheading",
+    description: "Get all statistical suffixes for a 6-digit subheading. Use when you have HIGH CONFIDENCE (85%+) in specific material/type.",
     parameters: {
       type: "object",
       properties: {
-        six_digit_base: {
+        subheading: {
           type: "string",
-          description: "The 6-digit base code to search for, e.g., '010121'"
+          description: "6-digit subheading code without periods, e.g., '080430' for Pineapples"
         }
       },
-      required: ["six_digit_base"]
+      required: ["subheading"]
+    }
+  },
+  {
+    type: "function",
+    name: "lookup_by_heading", 
+    description: "Get all subheadings and codes under a 4-digit heading. Use when you have MEDIUM CONFIDENCE (70-84%) in general category.",
+    parameters: {
+      type: "object",
+      properties: {
+        heading: {
+          type: "string",
+          description: "4-digit heading code, e.g., '0804' for dates, figs, pineapples, etc."
+        }
+      },
+      required: ["heading"]
     }
   },
   {
     type: "function", 
     name: "validate_hts_code",
-    description: "Validate if a complete HTS code exists in the official MongoDB database. Use this before returning any final classification to ensure the code is real.",
+    description: "Validate if a complete HTS code exists in the official MongoDB database. ALWAYS use before final classification.",
     parameters: {
       type: "object",
       properties: {
         hts_code: {
           type: "string",
-          description: "The complete HTS code to validate, e.g., '0101.21.00'"
+          description: "The complete HTS code with periods, e.g., '0804.30.20.00'"
         }
       },
       required: ["hts_code"]
@@ -60,15 +75,26 @@ async function executeMongoDBFunction(functionName, functionArgs) {
   
   try {
     switch (functionName) {
-      case 'lookup_hts_by_six_digit_base':
-        const lookupResults = await mongodbService.lookupBySixDigitBase(functionArgs.six_digit_base);
+      case 'lookup_by_subheading':
+        const lookupSubheadingResults = await mongodbService.lookupBySubheading(functionArgs.subheading);
         
-        console.log(`📤 Lookup result: ${lookupResults.length} codes found`);
+        console.log(`📤 Lookup by subheading result: ${lookupSubheadingResults.length} codes found`);
         
         return {
           success: true,
-          data: lookupResults,
-          message: `Found ${lookupResults.length} codes for six_digit_base: ${functionArgs.six_digit_base}`
+          data: lookupSubheadingResults,
+          message: `Found ${lookupSubheadingResults.length} codes for subheading: ${functionArgs.subheading}`
+        };
+
+      case 'lookup_by_heading':
+        const lookupHeadingResults = await mongodbService.lookupByHeading(functionArgs.heading);
+        
+        console.log(`📤 Lookup by heading result: ${lookupHeadingResults.length} codes found`);
+        
+        return {
+          success: true,
+          data: lookupHeadingResults,
+          message: `Found ${lookupHeadingResults.length} codes for heading: ${functionArgs.heading}`
         };
 
       case 'validate_hts_code':

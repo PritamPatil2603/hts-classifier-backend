@@ -47,30 +47,28 @@ class MongoDBService {
     return htsCode.replace(/\./g, '');
   }
 
-  async lookupBySixDigitBase(sixDigitBase) {
+  // Rename lookupBySixDigitBase to lookupBySubheading for consistency with the tool name
+  async lookupBySubheading(subheading) {
     await this.connect();
     try {
       // Clean up the format by removing dots
-      const cleanSixDigitBase = sixDigitBase.replace(/\./g, '');
+      const cleanSubheading = subheading.replace(/\./g, '');
       
-      console.log(`🔍 Looking up HTS codes for base: ${sixDigitBase} (cleaned: ${cleanSixDigitBase})`);
+      console.log(`🔍 Looking up HTS codes for subheading: ${subheading} (cleaned: ${cleanSubheading})`);
       
-      // Try multiple format variations to make lookups more robust
+      // Updated query - only search the subheading field
       const results = await this.collection.find({ 
-        $or: [
-          { six_digit_base: sixDigitBase },
-          { six_digit_base: cleanSixDigitBase }
-        ] 
+        subheading: cleanSubheading 
       }).toArray();
       
-      console.log(`📊 Found ${results.length} HTS codes for base`);
+      console.log(`📊 Found ${results.length} HTS codes for subheading`);
       if (results.length > 0) {
         console.log(`📋 First result: ${results[0].hts_code} - ${results[0].description}`);
       }
       
       return results;
     } catch (error) {
-      console.error('Error looking up by six_digit_base:', error);
+      console.error('Error looking up by subheading:', error);
       return [];
     }
   }
@@ -109,6 +107,35 @@ class MongoDBService {
     } catch (error) {
       console.error('Error validating HTS code:', error);
       return { isValid: false, details: null };
+    }
+  }
+
+  // Add this new function to look up by 4-digit heading
+  async lookupByHeading(heading) {
+    await this.connect();
+    try {
+      // Clean up the format by removing dots
+      const cleanHeading = heading.replace(/\./g, '');
+      
+      console.log(`🔍 Looking up HTS codes for heading: ${heading} (cleaned: ${cleanHeading})`);
+      
+      // Try multiple format variations to make lookups more robust
+      const results = await this.collection.find({ 
+        $or: [
+          { heading: heading },
+          { heading: cleanHeading }
+        ] 
+      }).toArray();
+      
+      console.log(`📊 Found ${results.length} HTS codes for heading`);
+      if (results.length > 0) {
+        console.log(`📋 First result: ${results[0].hts_code} - ${results[0].description}`);
+      }
+      
+      return results;
+    } catch (error) {
+      console.error('Error looking up by heading:', error);
+      return [];
     }
   }
 
