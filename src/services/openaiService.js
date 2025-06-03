@@ -1,5 +1,5 @@
 // services/openaiService.js
-// Final optimized OpenAI service - Clean version focused on prompt caching
+// Complete optimized OpenAI service with single API call processing and prompt caching
 
 const OpenAI = require('openai');
 const config = require('../config/config');
@@ -9,6 +9,9 @@ const mongodbService = require('./mongodbService');
 const openai = new OpenAI({
   apiKey: config.openai.apiKey,
 });
+
+// Cache for system prompt to ensure consistency across requests
+const CACHED_SYSTEM_PROMPT = config.systemPrompt;
 
 // MongoDB function tools - keep consistent for caching
 const mongodbTools = [
@@ -59,104 +62,155 @@ const mongodbTools = [
   }
 ];
 
-// File search tool
+// File search tool - keep consistent for caching
 const fileSearchTool = {
   type: "file_search",
   vector_store_ids: ["vs_68360919dc948191acabda3d3d33abdf"],
-  max_num_results: 10
+  max_num_results: 7
 };
 
-// Consistent tool array for caching
+// Consistent tool array for caching - NEVER change this order or structure
 const ALL_TOOLS = [fileSearchTool, ...mongodbTools];
 
 /**
- * 🔍 SIMPLE: Check if prompt caching is working
+ * 🔧 UTILITY: Count tokens approximately for debugging
  */
-function checkCaching(response) {
-  console.log(`\n🔍 CACHE CHECK:`);
-  console.log(`   Model: ${response.model}`);
-  console.log(`   Prompt Tokens: ${response.usage?.prompt_tokens || 'N/A'}`);
-  
-  // Check if caching is supported by looking at actual API response
-  const cacheData = response.usage?.prompt_tokens_details;
-  if (!cacheData) {
-    console.log(`❌ NO CACHE DATA FOUND`);
-    console.log(`   This means either:`);
-    console.log(`   - Model doesn't support caching`);
-    console.log(`   - Prompt is under 1024 tokens`);
-    console.log(`   - API version/configuration issue`);
-    console.log(`   Let's check the raw usage data...`);
-    console.log(`   Raw usage:`, JSON.stringify(response.usage, null, 2));
-    return { supported: false, working: false };
-  }
-  
-  // Check cache performance
-  const cached = cacheData.cached_tokens || 0;
-  const total = response.usage.prompt_tokens || 0;
-  const hitRate = total > 0 ? (cached / total * 100) : 0;
-  
-  console.log(`✅ CACHING IS SUPPORTED!`);
-  console.log(`   Cached Tokens: ${cached}/${total}`);
-  console.log(`   Hit Rate: ${hitRate.toFixed(1)}%`);
-  
-  if (cached === 0) {
-    console.log(`🔄 Status: Building cache (first request with this prompt)`);
-    return { supported: true, working: false, building: true };
-  } else {
-    console.log(`🎉 Status: Cache working! Saving ${(hitRate * 0.5).toFixed(1)}% cost`);
-    return { supported: true, working: true, hitRate, cached };
-  }
+function countTokensApproximate(text) {
+  // More accurate approximation: 1 token ≈ 3.5-4 characters for English text
+  return Math.ceil(text.length / 3.7);
 }
 
 /**
- * 🛠️ SIMPLE: Verify setup before making requests
+ * 🔧 UTILITY: Verify caching setup before making requests
  */
-function verifySetup() {
-  console.log(`\n🔧 SETUP CHECK:`);
+function verifyCachingSetup() {
+  console.log('\n🔍 VERIFYING CACHING SETUP:');
   
-  // Check token count (rough estimate)
-  const systemTokens = Math.ceil(config.systemPrompt.length / 4);
-  console.log(`   System prompt: ${systemTokens} tokens (need 1024+)`);
-  console.log(`   Model: ${config.openai.model}`);
+  // Check system prompt length
+  const systemPromptTokens = countTokensApproximate(CACHED_SYSTEM_PROMPT);
+  console.log(`📏 System prompt estimated tokens: ${systemPromptTokens}`);
   
-  // Don't hardcode model support - let OpenAI API tell us
-  console.log(`   Note: Caching support will be tested with actual API call`);
-  
-  if (systemTokens >= 1024) {
-    console.log(`✅ Setup ready - will test caching with API`);
+  if (systemPromptTokens < 1024) {
+    console.log(`🚨 WARNING: System prompt too short for caching (needs 1024+ tokens)`);
+    console.log(`   Current: ${systemPromptTokens}, Required: 1024+`);
   } else {
-    console.log(`⚠️ System prompt may be too short for caching`);
+    console.log(`✅ System prompt long enough for caching (${systemPromptTokens} tokens)`);
   }
   
-  return { systemTokens, ready: systemTokens >= 1024 };
+  // Check model support
+  console.log(`🤖 Model: ${config.openai.model}`);
+  const cachingSupportedModels = [
+    'gpt-4o', 'gpt-4o-mini', 'gpt-4o-2024-11-20', 'gpt-4o-2024-08-06',
+    'o1-2024-12-17', 'o1-preview', 'o1-mini'
+  ];
+  
+  const modelSupported = cachingSupportedModels.some(model => 
+    config.openai.model.toLowerCase().includes(model.toLowerCase())
+  );
+  
+  if (modelSupported) {
+    console.log(`✅ Model supports prompt caching`);
+  } else {
+    console.log(`🚨 WARNING: Model may not support prompt caching`);
+    console.log(`   Current: ${config.openai.model}`);
+    console.log(`   Supported: ${cachingSupportedModels.join(', ')}`);
+  }
+  
+  return { systemPromptTokens, modelSupported };
 }
 
 /**
- * 🔧 Create optimized input for caching
+ * 🔧 UTILITY: Create optimized input structure for maximum caching
  */
 function createOptimizedInput(productDescription) {
-  return [
+  // Always use the same system prompt structure for caching
+  const input = [
     {
       role: "system",
-      content: config.systemPrompt // This will be cached
+      content: CACHED_SYSTEM_PROMPT // This will be cached after first use
     },
     {
       role: "user", 
       content: productDescription // This varies per request
     }
   ];
+  
+  // Calculate total estimated tokens for debugging
+  const totalText = input.map(msg => msg.content).join(' ');
+  const estimatedTokens = countTokensApproximate(totalText);
+  console.log(`📏 Total estimated input tokens: ${estimatedTokens}`);
+  
+  return input;
 }
 
 /**
- * 🚀 Execute MongoDB functions in parallel
+ * 🔧 ENHANCED: Monitor cache performance with detailed debugging
+ */
+function monitorCachePerformance(response, operation) {
+  if (!response.usage) {
+    console.log(`⚠️ No usage data available for ${operation}`);
+    return null;
+  }
+  
+  const usage = response.usage;
+  console.log(`\n📊 USAGE DATA STRUCTURE (${operation}):`);
+  console.log(`   Model: ${response.model}`);
+  console.log(`   Total Prompt Tokens: ${usage.prompt_tokens}`);
+  console.log(`   Completion Tokens: ${usage.completion_tokens}`);
+  console.log(`   Total Tokens: ${usage.total_tokens}`);
+  
+  // Check for prompt_tokens_details
+  if (!usage.prompt_tokens_details) {
+    console.log(`⚠️ No prompt_tokens_details available for ${operation}`);
+    console.log(`   This could mean:`);
+    console.log(`   - Model doesn't support caching`);
+    console.log(`   - Prompt is under 1024 tokens`);
+    console.log(`   - API version issue`);
+    return null;
+  }
+  
+  const cachedTokens = usage.prompt_tokens_details.cached_tokens || 0;
+  const totalTokens = usage.prompt_tokens;
+  const cacheHitRate = totalTokens > 0 ? (cachedTokens / totalTokens * 100) : 0;
+  const costSavings = totalTokens > 0 ? (cachedTokens * 0.5 / totalTokens * 100) : 0;
+  
+  console.log(`\n📊 CACHE PERFORMANCE (${operation}):`);
+  console.log(`   Total Input Tokens: ${totalTokens}`);
+  console.log(`   Cached Tokens: ${cachedTokens}`);
+  console.log(`   New Tokens Processed: ${totalTokens - cachedTokens}`);
+  console.log(`   Cache Hit Rate: ${cacheHitRate.toFixed(1)}%`);
+  console.log(`   Cost Savings: ~${costSavings.toFixed(1)}%`);
+  console.log(`   Response ID: ${response.id}`);
+  
+  // Diagnostic warnings
+  if (totalTokens >= 1024 && cachedTokens === 0) {
+    console.log(`🚨 WARNING: Prompt >1024 tokens but no caching detected!`);
+    console.log(`   Check: Model support, prompt structure consistency`);
+  } else if (cachedTokens > 0) {
+    console.log(`🎉 CACHE WORKING: ${cachedTokens} tokens served from cache!`);
+  }
+  
+  return {
+    totalTokens,
+    cachedTokens,
+    cacheHitRate,
+    costSavings
+  };
+}
+
+/**
+ * 🚀 OPTIMIZED: Execute MongoDB functions in parallel
  */
 async function executeMongoDBFunctionsInParallel(functionCalls) {
-  console.log(`\n🚀 Executing ${functionCalls.length} database functions in parallel...`);
+  console.log(`\n🚀 EXECUTING ${functionCalls.length} MONGODB FUNCTIONS IN PARALLEL`);
   
   const functionPromises = functionCalls.map(async (functionCall) => {
     const functionName = functionCall.name;
     const functionArgs = JSON.parse(functionCall.arguments);
     const callId = functionCall.call_id;
+    
+    console.log(`🎯 Processing: ${functionName} (${callId})`);
+    console.log(`   Arguments: ${JSON.stringify(functionArgs)}`);
     
     try {
       let result;
@@ -164,31 +218,34 @@ async function executeMongoDBFunctionsInParallel(functionCalls) {
       
       switch (functionName) {
         case 'lookup_by_subheading':
-          const subResults = await mongodbService.lookupBySubheading(functionArgs.subheading);
+          const lookupSubheadingResults = await mongodbService.lookupBySubheading(functionArgs.subheading);
           result = {
             success: true,
-            data: subResults,
-            message: `Found ${subResults.length} codes for subheading: ${functionArgs.subheading}`
+            data: lookupSubheadingResults,
+            message: `Found ${lookupSubheadingResults.length} codes for subheading: ${functionArgs.subheading}`,
+            executionTime: Date.now() - startTime
           };
           break;
 
         case 'lookup_by_heading':
-          const headResults = await mongodbService.lookupByHeading(functionArgs.heading);
+          const lookupHeadingResults = await mongodbService.lookupByHeading(functionArgs.heading);
           result = {
             success: true,
-            data: headResults,
-            message: `Found ${headResults.length} codes for heading: ${functionArgs.heading}`
+            data: lookupHeadingResults,
+            message: `Found ${lookupHeadingResults.length} codes for heading: ${functionArgs.heading}`,
+            executionTime: Date.now() - startTime
           };
           break;
 
         case 'validate_hts_code':
-          const validation = await mongodbService.validateHtsCode(functionArgs.hts_code);
+          const validationResult = await mongodbService.validateHtsCode(functionArgs.hts_code);
           result = {
             success: true,
-            data: validation,
-            message: validation.isValid 
+            data: validationResult,
+            message: validationResult.isValid 
               ? `HTS code ${functionArgs.hts_code} is valid` 
-              : `HTS code ${functionArgs.hts_code} is NOT valid`
+              : `HTS code ${functionArgs.hts_code} is NOT valid`,
+            executionTime: Date.now() - startTime
           };
           break;
 
@@ -196,7 +253,7 @@ async function executeMongoDBFunctionsInParallel(functionCalls) {
           throw new Error(`Unknown function: ${functionName}`);
       }
       
-      console.log(`✅ ${functionName} completed (${Date.now() - startTime}ms)`);
+      console.log(`✅ ${functionName} completed in ${result.executionTime}ms`);
       
       return {
         type: "function_call_output",
@@ -205,93 +262,108 @@ async function executeMongoDBFunctionsInParallel(functionCalls) {
       };
       
     } catch (error) {
-      console.error(`❌ ${functionName} error:`, error.message);
+      console.error(`❌ Error in function ${functionName}:`, error.message);
       return {
         type: "function_call_output",
         call_id: callId,
         output: JSON.stringify({
           success: false,
-          message: `Error: ${error.message}`
+          message: `Error executing ${functionName}: ${error.message}`,
+          executionTime: Date.now() - Date.now()
         })
       };
     }
   });
   
+  // Execute all functions in parallel and wait for completion
   const results = await Promise.all(functionPromises);
-  console.log(`✅ All database functions completed`);
+  console.log(`✅ All ${results.length} MongoDB functions completed in parallel`);
+  
   return results;
 }
 
 /**
- * 🎯 Process function calls with single API call (NO RECURSION)
+ * 🚨 CRITICAL FIX: Single API call processing (NO RECURSION)
  */
 async function processFunctionCallsOptimized(response) {
-  console.log('\n🔧 Processing function calls...');
+  console.log('\n🔧 PROCESSING FUNCTION CALLS (SINGLE CALL OPTIMIZATION)');
   
   const functionCalls = response.output.filter(output => 
     output.type === 'function_call' && 
     mongodbTools.some(tool => tool.name === output.name)
   );
   
+  console.log(`📊 Found ${functionCalls.length} MongoDB function calls`);
+  
   if (functionCalls.length === 0) {
-    console.log('✅ No function calls to process');
+    console.log(`✅ No MongoDB function calls to process`);
     return response;
   }
   
-  console.log(`📊 Found ${functionCalls.length} function calls`);
-  
-  // Execute all functions in parallel
+  // 🚀 Execute ALL MongoDB functions in parallel
   const functionOutputs = await executeMongoDBFunctionsInParallel(functionCalls);
   
-  // Make SINGLE follow-up API call
-  console.log(`📤 Making single follow-up API call...`);
+  console.log(`📤 Making SINGLE follow-up API call with ${functionOutputs.length} function results`);
+  
+  // 🚨 CRITICAL: Make ONLY ONE follow-up API call with ALL function results
   const followUpResponse = await openai.responses.create({
     model: config.openai.model,
-    input: functionOutputs,
-    previous_response_id: response.id,
-    tools: ALL_TOOLS,
-    temperature: 0.21,
-    max_output_tokens: 2048,
+    input: functionOutputs, // All function outputs in one call
+    previous_response_id: response.id, // Maintain conversation context
+    tools: ALL_TOOLS, // Use consistent tool array for caching
+    temperature: 0.0,
+    max_output_tokens: 1500,
     top_p: 1,
     store: true
   });
   
-  console.log(`✅ Follow-up completed: ${followUpResponse.id}`);
+  console.log(`✅ Single follow-up response created: ${followUpResponse.id}`);
   
-  // NO RECURSION - return immediately
+  // 🚨 CRITICAL: NO MORE RECURSIVE CALLS - Return immediately
+  // This eliminates the multiple API calls that were causing high latency
+  console.log(`🛑 Returning final response (no recursion) - latency optimization complete`);
+  
   return followUpResponse;
 }
 
 /**
- * 📄 Extract response content
+ * 🔧 ENHANCED: Extract structured response with better error handling
  */
 function extractStructuredResponse(response) {
-  console.log(`\n📄 Extracting response...`);
+  console.log(`\n🔍 EXTRACTING RESPONSE (ID: ${response.id})`);
   
   if (!response.output || !Array.isArray(response.output)) {
-    return { responseType: 'error', message: 'No output found' };
+    console.log('❌ No output array found in response');
+    return { responseType: 'error', message: 'No output found in response' };
   }
 
-  // Look for message content
+  console.log(`📊 Found ${response.output.length} output items`);
+  
+  // Log output structure for debugging
+  response.output.forEach((item, index) => {
+    console.log(`   Item ${index}: type=${item.type}`);
+  });
+
+  // Look for the final message content
   const messages = response.output.filter(item => item.type === 'message');
   const lastMessage = messages[messages.length - 1];
   
   if (lastMessage && lastMessage.content) {
     for (const content of lastMessage.content) {
       if (content.type === 'output_text' && content.text) {
-        console.log(`✅ Found response text (${content.text.length} chars)`);
+        console.log(`📄 Found final text response (${content.text.length} chars)`);
         
-        // Try to parse JSON
+        // Try to extract JSON from text
         const jsonMatch = content.text.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           try {
             const parsed = JSON.parse(jsonMatch[0]);
             if (parsed.responseType) {
-              console.log(`✅ Structured response: ${parsed.responseType}`);
+              console.log(`✅ Extracted structured response: ${parsed.responseType}`);
               return parsed;
             }
           } catch (error) {
-            console.log('⚠️ JSON parsing failed, using plain text');
+            console.log('⚠️ JSON parsing failed, treating as plain text');
           }
         }
         
@@ -303,64 +375,63 @@ function extractStructuredResponse(response) {
     }
   }
 
-  console.log('❌ Could not extract response');
-  return { responseType: 'error', message: 'Could not extract response' };
+  console.log('❌ No extractable response found in output');
+  return { responseType: 'error', message: 'Could not extract response from output' };
 }
 
 /**
- * 🚀 MAIN: Start classification
+ * 🚀 MAIN: Start classification with full optimization
  */
 async function startClassification(productDescription) {
   const startTime = Date.now();
   
   try {
-    // Verify setup
-    const setup = verifySetup();
+    // 🔍 Verify caching setup
+    const setupInfo = verifyCachingSetup();
     
-    console.log('\n🚀 Starting classification...');
-    console.log(`📝 Product: ${productDescription.substring(0, 80)}...`);
+    console.log('\n🚀 STARTING CLASSIFICATION (FULLY OPTIMIZED)');
+    console.log(`📝 Product: ${productDescription.substring(0, 100)}...`);
 
-    // Create input
-    const input = createOptimizedInput(productDescription);
+    // Create optimized input for maximum caching
+    const optimizedInput = createOptimizedInput(productDescription);
 
-    // Make API call
+    // Make initial API call
+    console.log(`📤 Making initial API call to ${config.openai.model}`);
     const response = await openai.responses.create({
       model: config.openai.model,
-      input: input,
-      tools: ALL_TOOLS,
-      temperature: 0.21,
-      max_output_tokens: 2048,
+      input: optimizedInput,
+      tools: ALL_TOOLS, // Consistent tool array for caching
+      temperature: 0.0,
+      max_output_tokens: 1500,
       top_p: 1,
       store: true
     });
 
-    console.log(`✅ Initial response: ${response.id}`);
+    console.log(`✅ Initial response created: ${response.id}`);
+    const initialCachePerf = monitorCachePerformance(response, 'INITIAL_CLASSIFICATION');
     
-    // Check caching
-    const cacheStatus = checkCaching(response);
-    
-    // Process any function calls
+    // 🚨 CRITICAL: Single function processing call (no recursion)
     const finalResponse = await processFunctionCallsOptimized(response);
     
-    // Check caching on final response if different
-    let finalCacheStatus = cacheStatus;
+    // Monitor cache performance for follow-up call if it was made
+    let finalCachePerf = null;
     if (finalResponse.id !== response.id) {
-      finalCacheStatus = checkCaching(finalResponse);
+      finalCachePerf = monitorCachePerformance(finalResponse, 'FUNCTION_PROCESSING');
     }
 
-    // Extract response
+    // Extract the final structured response
     const extractedResponse = extractStructuredResponse(finalResponse);
     
     const totalTime = Date.now() - startTime;
-    console.log(`⏱️ Total time: ${totalTime}ms`);
+    console.log(`⏱️ TOTAL CLASSIFICATION TIME: ${totalTime}ms`);
     
-    // Summary
-    console.log(`\n📊 SUMMARY:`);
-    console.log(`   Time: ${totalTime}ms`);
-    console.log(`   API calls: ${finalResponse.id !== response.id ? 2 : 1}`);
-    console.log(`   Cache: ${finalCacheStatus.working ? '✅ Working' : finalCacheStatus.supported ? '🔄 Building' : '⚠️ Not detected'}`);
-    if (!finalCacheStatus.supported) {
-      console.log(`   Note: Run identical request again to test if caching activates`);
+    // Performance summary
+    console.log(`\n📈 PERFORMANCE SUMMARY:`);
+    console.log(`   Total Time: ${totalTime}ms`);
+    console.log(`   API Calls Made: ${finalResponse.id !== response.id ? 2 : 1}`);
+    console.log(`   Caching Status: ${initialCachePerf ? 'Available' : 'Not Available'}`);
+    if (initialCachePerf && initialCachePerf.cachedTokens > 0) {
+      console.log(`   Cache Savings: ${initialCachePerf.costSavings.toFixed(1)}%`);
     }
     
     return {
@@ -368,29 +439,33 @@ async function startClassification(productDescription) {
       response: extractedResponse,
       performance: {
         total_time_ms: totalTime,
-        api_calls_made: finalResponse.id !== response.id ? 2 : 1,
-        cache_status: finalCacheStatus,
-        setup_info: setup
+        cache_performance: finalResponse.usage?.prompt_tokens_details || null,
+        setup_info: setupInfo,
+        api_calls_made: finalResponse.id !== response.id ? 2 : 1
       }
     };
 
   } catch (error) {
     const totalTime = Date.now() - startTime;
-    console.error(`❌ Classification error (${totalTime}ms):`, error);
+    console.error(`❌ Error starting classification (${totalTime}ms):`, error);
     throw error;
   }
 }
 
 /**
- * 🔄 MAIN: Continue classification
+ * 🔄 MAIN: Continue classification with optimization
  */
 async function continueClassification(previousResponseId, userSelection) {
   const startTime = Date.now();
   
   try {
-    console.log('\n🔄 Continuing classification...');
-    console.log(`🔗 Previous: ${previousResponseId}`);
-    console.log(`💬 Input: ${userSelection}`);
+    console.log('\n🔄 CONTINUING CLASSIFICATION (OPTIMIZED)');
+    console.log(`🔗 Previous Response ID: ${previousResponseId}`);
+    console.log(`💬 User Selection: ${userSelection}`);
+
+    // Estimate tokens for the user input
+    const userInputTokens = countTokensApproximate(userSelection);
+    console.log(`📏 User input estimated tokens: ${userInputTokens}`);
 
     const response = await openai.responses.create({
       model: config.openai.model,
@@ -400,155 +475,113 @@ async function continueClassification(previousResponseId, userSelection) {
           content: userSelection
         }
       ],
-      previous_response_id: previousResponseId,
-      tools: ALL_TOOLS,
-      temperature: 0.21,
-      max_output_tokens: 2048,
+      previous_response_id: previousResponseId, // Maintains conversation context and caching
+      tools: ALL_TOOLS, // Consistent tool array for caching
+      temperature: 0.0,
+      max_output_tokens: 1500,
       top_p: 1,
       store: true
     });
 
-    console.log(`✅ Continue response: ${response.id}`);
+    console.log(`✅ Continue response created: ${response.id}`);
+    const continueCachePerf = monitorCachePerformance(response, 'CONTINUE_CLASSIFICATION');
     
-    // Check caching
-    const cacheStatus = checkCaching(response);
-    
-    // Process function calls
+    // 🚨 CRITICAL: Single function processing call (no recursion)
     const finalResponse = await processFunctionCallsOptimized(response);
     
-    // Check final caching
-    let finalCacheStatus = cacheStatus;
+    // Monitor cache performance for follow-up call if it was made
+    let finalCachePerf = null;
     if (finalResponse.id !== response.id) {
-      finalCacheStatus = checkCaching(finalResponse);
+      finalCachePerf = monitorCachePerformance(finalResponse, 'CONTINUE_FUNCTION_PROCESSING');
     }
 
     const extractedResponse = extractStructuredResponse(finalResponse);
     
     const totalTime = Date.now() - startTime;
-    console.log(`⏱️ Continue time: ${totalTime}ms`);
+    console.log(`⏱️ TOTAL CONTINUE TIME: ${totalTime}ms`);
     
     return {
       response_id: finalResponse.id,
       response: extractedResponse,
       performance: {
         total_time_ms: totalTime,
-        api_calls_made: finalResponse.id !== response.id ? 2 : 1,
-        cache_status: finalCacheStatus
+        cache_performance: finalResponse.usage?.prompt_tokens_details || null,
+        api_calls_made: finalResponse.id !== response.id ? 2 : 1
       }
     };
 
   } catch (error) {
     const totalTime = Date.now() - startTime;
-    console.error(`❌ Continue error (${totalTime}ms):`, error);
+    console.error(`❌ Error continuing classification (${totalTime}ms):`, error);
     throw error;
   }
 }
 
 /**
- * 🧪 TEST: Cache performance test
+ * 🔥 UTILITY: Warm up the cache for better performance
  */
-async function testCachePerformance() {
-  console.log('\n🧪 TESTING CACHE PERFORMANCE...');
-  console.log(`🤖 Testing with model: ${config.openai.model}`);
-  
-  const testProduct = "Laptop computer for testing cache performance with consistent input to verify caching";
-  
+async function warmUpCache() {
   try {
-    // First request
-    console.log('📤 First request (testing if caching is supported)...');
-    const start1 = Date.now();
-    const result1 = await startClassification(testProduct);
-    const time1 = Date.now() - start1;
+    console.log('\n🔥 WARMING UP PROMPT CACHE...');
     
-    // Wait 2 seconds
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    const dummyInput = createOptimizedInput("Cache warming request - this builds the system prompt cache");
     
-    // Second identical request
-    console.log('\n📤 Second identical request (testing for cache hit)...');
-    const start2 = Date.now();
-    const result2 = await startClassification(testProduct);
-    const time2 = Date.now() - start2;
+    const response = await openai.responses.create({
+      model: config.openai.model,
+      input: dummyInput,
+      tools: ALL_TOOLS,
+      temperature: 0.21,
+      max_output_tokens: 50, // Minimal output for warmup
+      top_p: 1,
+      store: true
+    });
     
-    // Compare results
-    console.log('\n🎯 CACHE TEST RESULTS:');
-    console.log(`Model tested: ${config.openai.model}`);
-    console.log(`First request:  ${time1}ms - Cache: ${result1.performance.cache_status.supported ? (result1.performance.cache_status.working ? 'Working' : 'Building') : 'Not detected'}`);
-    console.log(`Second request: ${time2}ms - Cache: ${result2.performance.cache_status.supported ? (result2.performance.cache_status.working ? 'Working' : 'Building') : 'Not detected'}`);
+    console.log(`✅ Cache warmed up with response: ${response.id}`);
+    monitorCachePerformance(response, 'CACHE_WARMUP');
     
-    const improvement = time1 > time2 ? `${((time1 - time2) / time1 * 100).toFixed(1)}% faster` : 'No improvement';
-    console.log(`Performance: ${improvement}`);
-    
-    if (result2.performance.cache_status.working) {
-      console.log(`🎉 SUCCESS: Cache is working with ${config.openai.model}!`);
-      console.log(`💰 Cost savings: ${(result2.performance.cache_status.hitRate * 0.5).toFixed(1)}%`);
-    } else if (result1.performance.cache_status.supported || result2.performance.cache_status.supported) {
-      console.log(`🔄 PARTIAL: Model supports caching but cache building may need more time`);
-    } else {
-      console.log(`⚠️ INCONCLUSIVE: No cache data detected`);
-      console.log(`   This could mean:`);
-      console.log(`   - Model ${config.openai.model} doesn't support caching`);
-      console.log(`   - Prompt structure needs adjustment`);
-      console.log(`   - API configuration issue`);
-    }
-    
-    return { result1, result2, time1, time2, improvement };
-    
+    return response.id;
   } catch (error) {
-    console.error('❌ Cache test failed:', error);
+    console.error('❌ Error warming up cache:', error);
     return null;
   }
 }
 
 /**
- * 🔬 SIMPLE: Test if current model supports caching
+ * 🔍 UTILITY: Health check for the OpenAI service
  */
-async function testModelCachingSupport() {
-  console.log('\n🔬 TESTING MODEL CACHING SUPPORT...');
-  console.log(`🤖 Model: ${config.openai.model}`);
-  
+async function healthCheck() {
   try {
-    const response = await openai.responses.create({
+    const setupInfo = verifyCachingSetup();
+    
+    // Test basic API connectivity
+    const testResponse = await openai.responses.create({
       model: config.openai.model,
       input: [
         {
           role: "system",
-          content: config.systemPrompt
+          content: "You are a test assistant."
         },
         {
           role: "user",
-          content: "Simple test to check if this model supports prompt caching"
+          content: "Respond with 'Health check successful'"
         }
       ],
-      max_output_tokens: 50
+      max_output_tokens: 20,
+      temperature: 0
     });
     
-    const cacheSupported = !!response.usage?.prompt_tokens_details;
-    
-    console.log(`📊 Raw usage data:`, JSON.stringify(response.usage, null, 2));
-    console.log(`\n🎯 RESULT:`);
-    
-    if (cacheSupported) {
-      const cached = response.usage.prompt_tokens_details.cached_tokens || 0;
-      console.log(`✅ Model ${config.openai.model} SUPPORTS caching!`);
-      console.log(`   Cached tokens: ${cached} (expected 0 on first request)`);
-      console.log(`   Make another identical request to see cache in action`);
-    } else {
-      console.log(`❌ Model ${config.openai.model} does NOT support caching`);
-      console.log(`   No prompt_tokens_details found in response`);
-    }
-    
     return {
+      status: 'healthy',
       model: config.openai.model,
-      supported: cacheSupported,
-      usage: response.usage
+      setup_info: setupInfo,
+      test_response_id: testResponse.id,
+      cache_supported: !!testResponse.usage?.prompt_tokens_details
     };
-    
   } catch (error) {
-    console.error('❌ Test failed:', error);
     return {
-      model: config.openai.model,
-      supported: false,
-      error: error.message
+      status: 'unhealthy',
+      error: error.message,
+      model: config.openai.model
     };
   }
 }
@@ -556,8 +589,9 @@ async function testModelCachingSupport() {
 module.exports = {
   startClassification,
   continueClassification,
-  testCachePerformance,
-  testModelCachingSupport,
-  verifySetup,
-  checkCaching
+  warmUpCache,
+  healthCheck,
+  // Utility functions for testing
+  verifyCachingSetup,
+  countTokensApproximate
 };
