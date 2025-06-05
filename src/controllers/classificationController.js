@@ -4,25 +4,27 @@
 const openaiService = require('../services/openaiService');
 const mongodbService = require('../services/mongodbService');
 
-// Simple validation (keep this - it's our core value)
+// ✅ IMPROVED: Handle new validation structure  
 async function validateHtsCode(htsCode) {
   try {
     const validation = await mongodbService.validateHtsCode(htsCode);
     
-    if (validation.isValid) {
+    if (validation.valid) {
       return {
         isValid: true,
         message: `HTS code ${htsCode} validated successfully`,
-        details: validation.details
+        details: validation.details,
+        validationData: validation
       };
     } else {
       return {
         isValid: false,
-        message: `HTS code ${htsCode} not found in database`,
+        message: validation.error,
         details: null,
         relatedCodes: validation.relatedCodes || [],
         components: validation.components,
-        hasAlternatives: !!(validation.relatedCodes && validation.relatedCodes.length > 0)
+        hasAlternatives: !!(validation.relatedCodes && validation.relatedCodes.length > 0),
+        validationData: validation
       };
     }
   } catch (error) {
@@ -30,12 +32,13 @@ async function validateHtsCode(htsCode) {
       isValid: false,
       message: `Validation error: ${error.message}`,
       details: null,
-      hasAlternatives: false
+      hasAlternatives: false,
+      validationData: null
     };
   }
 }
 
-// Simple correction (keep this - it's our core value)
+// ✅ IMPROVED: Better correction prompts with structured data
 async function requestCorrection(responseId, invalidCode, validationResult) {
   try {
     let correctionPrompt;
@@ -43,18 +46,36 @@ async function requestCorrection(responseId, invalidCode, validationResult) {
     if (validationResult.hasAlternatives && validationResult.relatedCodes) {
       const codeOptions = validationResult.relatedCodes.slice(0, 10);
       const codeList = codeOptions.map((code, index) => 
-        `${String.fromCharCode(65 + index)}. ${code.hts_code} - ${code.description}`
-      ).join('\n');
+        `${index + 1}. ${code.hts_code} - ${code.description}
+   Full: ${code.full_description}
+   Context: ${code.context_path}`
+      ).join('\n\n');
       
-      correctionPrompt = `The HTS code ${invalidCode} does not exist in the official US HTS database.
+      correctionPrompt = `VALIDATION FAILED for your classification.
 
-Here are OFFICIAL HTS codes under the same subheading:
+ORIGINAL CLASSIFICATION: ${invalidCode}
+VALIDATION ERROR: ${validationResult.validationData.error}
 
+ANALYSIS: Your subheading classification (${validationResult.validationData.subheading_analysis?.subheading}) appears ${validationResult.validationData.subheading_analysis?.subheading_appears_correct ? 'CORRECT' : 'INCORRECT'}.
+
+${validationResult.validationData.suggestion_context}
+
+VALID HTS CODES UNDER YOUR CHOSEN SUBHEADING:
 ${codeList}
 
-Select the most appropriate code from above based on the product description and user selections.`;
+Please select the most appropriate HTS code from the above official options and provide your corrected classification using the same JSON schema.`;
     } else {
-      correctionPrompt = `The HTS code ${invalidCode} is invalid. Please provide a corrected 10-digit HTS code in format XXXX.XX.XX.XX.`;
+      correctionPrompt = `VALIDATION FAILED for your classification.
+
+ORIGINAL CLASSIFICATION: ${invalidCode}
+VALIDATION ERROR: ${validationResult.validationData.error}
+
+Please provide a corrected 10-digit US HTS code that exists in the official database.
+
+Requirements:
+- Must be exactly 10 digits in format XXXX.XX.XX.XX
+- Must exist in the official HTS database
+- Provide your corrected classification using the same JSON schema`;
     }
 
     const result = await openaiService.continueClassification(responseId, correctionPrompt);
@@ -65,7 +86,6 @@ Select the most appropriate code from above based on the product description and
   }
 }
 
-// SIMPLIFIED: Start classification (no sessions!)
 async function startClassification(req, res) {
   const startTime = Date.now();
   
@@ -77,6 +97,7 @@ async function startClassification(req, res) {
     
     if (!productDescription || productDescription.trim().length === 0) {
       return res.status(400).json({ 
+        success: false,
         error: 'Product description is required',
         code: 'MISSING_DESCRIPTION'
       });
@@ -89,9 +110,27 @@ async function startClassification(req, res) {
     console.log('✅ OpenAI classification completed');
     console.log('📊 Response type:', result.response?.responseType);
     
+    // ✅ Handle error responses from AI
+    if (result.response?.responseType === 'error') {
+      const duration = Date.now() - startTime;
+      return res.status(500).json({
+        success: false,
+        error: 'AI response error',
+        details: result.response.message,
+        code: 'AI_ERROR',
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+    
     // Handle response based on type
     if (result.response?.responseType === 'classification') {
       const htsCode = result.response.htsCode;
+      console.log('🔍 Validating HTS code:', htsCode);
+      
       const validation = await validateHtsCode(htsCode);
       
       if (validation.isValid) {
@@ -107,10 +146,14 @@ async function startClassification(req, res) {
             database_confirmed: "✅ Validated in official database",
             validation_details: validation.details
           },
-          performance: { duration },
+          performance: { 
+            duration,
+            openai_time_ms: result.response_time_ms
+          },
           timestamp: new Date().toISOString()
         });
       } else {
+        console.log('❌ Validation failed, requesting correction...');
         const correctionResult = await requestCorrection(result.response_id, htsCode, validation);
         const duration = Date.now() - startTime;
         
@@ -122,13 +165,17 @@ async function startClassification(req, res) {
           validation_attempted: {
             original_code: htsCode,
             validation_result: validation.message,
-            correction_requested: true
+            correction_requested: true,
+            alternatives_found: validation.hasAlternatives
           },
-          performance: { duration },
+          performance: { 
+            duration,
+            openai_time_ms: result.response_time_ms + (correctionResult.response_time_ms || 0)
+          },
           timestamp: new Date().toISOString()
         });
       }
-    } else if (result.response?.responseType === 'reasoning_question') {
+    } else if (result.response?.responseType === 'question') { // ✅ Updated from 'reasoning_question'
       const duration = Date.now() - startTime;
       
       return res.status(200).json({
@@ -136,14 +183,24 @@ async function startClassification(req, res) {
         type: 'question',
         response_id: result.response_id,
         ...result.response,
-        performance: { duration },
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms
+        },
         timestamp: new Date().toISOString()
       });
     } else {
+      const duration = Date.now() - startTime;
       return res.status(500).json({ 
         success: false,
         error: 'Unexpected response format from AI',
-        code: 'INVALID_RESPONSE_FORMAT'
+        code: 'INVALID_RESPONSE_FORMAT',
+        received_type: result.response?.responseType,
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms || 0
+        },
+        timestamp: new Date().toISOString()
       });
     }
   } catch (error) {
@@ -155,17 +212,16 @@ async function startClassification(req, res) {
       error: 'Failed to start classification', 
       code: 'CLASSIFICATION_ERROR',
       message: error.message,
-      duration
+      performance: { duration },
+      timestamp: new Date().toISOString()
     });
   }
 }
 
-// SIMPLIFIED: Continue classification (use response_id directly!)
 async function continueClassification(req, res) {
   const startTime = Date.now();
   
   try {
-    // ✅ SIMPLIFIED: Support both field names for backwards compatibility
     const { response_id, sessionId, selection } = req.body;
     const actualResponseId = response_id || sessionId;
     
@@ -175,6 +231,7 @@ async function continueClassification(req, res) {
     
     if (!actualResponseId || !selection) {
       return res.status(400).json({ 
+        success: false,
         error: 'Response ID and selection are required',
         code: 'MISSING_PARAMETERS'
       });
@@ -187,9 +244,27 @@ async function continueClassification(req, res) {
     console.log('✅ Continue classification completed');
     console.log('📊 Response type:', result.response?.responseType);
     
+    // ✅ Handle error responses from AI
+    if (result.response?.responseType === 'error') {
+      const duration = Date.now() - startTime;
+      return res.status(500).json({
+        success: false,
+        error: 'AI response error',
+        details: result.response.message,
+        code: 'AI_ERROR',
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms
+        },
+        timestamp: new Date().toISOString()
+      });
+    }
+    
     // Handle response (same logic as start)
     if (result.response?.responseType === 'classification') {
       const htsCode = result.response.htsCode;
+      console.log('🔍 Validating HTS code:', htsCode);
+      
       const validation = await validateHtsCode(htsCode);
       
       if (validation.isValid) {
@@ -205,10 +280,14 @@ async function continueClassification(req, res) {
             database_confirmed: "✅ Validated in official database",
             validation_details: validation.details
           },
-          performance: { duration },
+          performance: { 
+            duration,
+            openai_time_ms: result.response_time_ms
+          },
           timestamp: new Date().toISOString()
         });
       } else {
+        console.log('❌ Validation failed, requesting correction...');
         const correctionResult = await requestCorrection(result.response_id, htsCode, validation);
         const duration = Date.now() - startTime;
         
@@ -220,13 +299,17 @@ async function continueClassification(req, res) {
           validation_attempted: {
             original_code: htsCode,
             validation_result: validation.message,
-            correction_requested: true
+            correction_requested: true,
+            alternatives_found: validation.hasAlternatives
           },
-          performance: { duration },
+          performance: { 
+            duration,
+            openai_time_ms: result.response_time_ms + (correctionResult.response_time_ms || 0)
+          },
           timestamp: new Date().toISOString()
         });
       }
-    } else if (result.response?.responseType === 'reasoning_question') {
+    } else if (result.response?.responseType === 'question') { // ✅ Updated from 'reasoning_question'
       const duration = Date.now() - startTime;
       
       return res.status(200).json({
@@ -234,14 +317,24 @@ async function continueClassification(req, res) {
         type: 'question',
         response_id: result.response_id,
         ...result.response,
-        performance: { duration },
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms
+        },
         timestamp: new Date().toISOString()
       });
     } else {
+      const duration = Date.now() - startTime;
       return res.status(500).json({ 
         success: false,
         error: 'Unexpected response format from AI',
-        code: 'INVALID_RESPONSE_FORMAT'
+        code: 'INVALID_RESPONSE_FORMAT',
+        received_type: result.response?.responseType,
+        performance: { 
+          duration,
+          openai_time_ms: result.response_time_ms || 0
+        },
+        timestamp: new Date().toISOString()
       });
     }
   } catch (error) {
@@ -253,7 +346,8 @@ async function continueClassification(req, res) {
       error: 'Failed to continue classification', 
       code: 'CONTINUE_ERROR',
       message: error.message,
-      duration
+      performance: { duration },
+      timestamp: new Date().toISOString()
     });
   }
 }
