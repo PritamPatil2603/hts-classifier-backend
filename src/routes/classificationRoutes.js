@@ -5,25 +5,18 @@ const express = require('express');
 const router = express.Router();
 const classificationController = require('../controllers/classificationController');
 
-// ✅ EXISTING: Start a new classification
+// Start a new classification
 router.post('/classify', classificationController.startClassification);
 
-// ✅ EXISTING: Continue an existing classification
+// Continue classification using response_id
 router.post('/classify/continue', classificationController.continueClassification);
 
-// ✅ EXISTING: Get session status
-router.get('/classify/session/:sessionId', classificationController.getSessionStatus);
-
-// ✅ NEW: Get session statistics (for monitoring)
-router.get('/classify/stats', classificationController.getSessionStats);
-
-// ✅ NEW: Test endpoint for development
-router.get('/test', (req, res) => {
+// Simple health check
+router.get('/health', (req, res) => {
   res.json({
     success: true,
     message: 'HTS Classification API is running',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    timestamp: new Date().toISOString()
   });
 });
 
