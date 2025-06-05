@@ -225,15 +225,20 @@ async function continueClassification(req, res) {
     const { response_id, sessionId, selection } = req.body;
     const actualResponseId = response_id || sessionId;
     
+    // ✅ ADD DEBUG LOGGING
     console.log('\n🔄 CONTINUE CLASSIFICATION REQUEST');
-    console.log('🔗 Response ID:', actualResponseId);
-    console.log('💬 Selection:', selection);
+    console.log('📦 Request body:', JSON.stringify(req.body, null, 2));
+    console.log('🔗 response_id:', response_id);
+    console.log('🔗 sessionId:', sessionId);
+    console.log('🔗 actualResponseId:', actualResponseId);
+    console.log('💬 selection:', selection);
     
     if (!actualResponseId || !selection) {
       return res.status(400).json({ 
         success: false,
         error: 'Response ID and selection are required',
-        code: 'MISSING_PARAMETERS'
+        code: 'MISSING_PARAMETERS',
+        received: { response_id, sessionId, selection }
       });
     }
     
