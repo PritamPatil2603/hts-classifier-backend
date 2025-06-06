@@ -1,363 +1,154 @@
-// src/controllers/classificationController.js
-// Simplified controller without session management
-
 const openaiService = require('../services/openaiService');
-const mongodbService = require('../services/mongodbService');
+const htsValidationService = require('../services/htsValidationService'); // ✅ ADD: New service
 
-// ✅ IMPROVED: Handle new validation structure  
-async function validateHtsCode(htsCode) {
-  try {
-    const validation = await mongodbService.validateHtsCode(htsCode);
-    
-    if (validation.valid) {
-      return {
-        isValid: true,
-        message: `HTS code ${htsCode} validated successfully`,
-        details: validation.details,
-        validationData: validation
-      };
-    } else {
-      return {
-        isValid: false,
-        message: validation.error,
-        details: null,
-        relatedCodes: validation.relatedCodes || [],
-        components: validation.components,
-        hasAlternatives: !!(validation.relatedCodes && validation.relatedCodes.length > 0),
-        validationData: validation
-      };
-    }
-  } catch (error) {
-    return {
-      isValid: false,
-      message: `Validation error: ${error.message}`,
-      details: null,
-      hasAlternatives: false,
-      validationData: null
-    };
-  }
-}
+// Lightweight session tracking (just to associate sessions with users)
+const sessions = {};
 
-// ✅ IMPROVED: Better correction prompts with structured data
-async function requestCorrection(responseId, invalidCode, validationResult) {
-  try {
-    let correctionPrompt;
-    
-    if (validationResult.hasAlternatives && validationResult.relatedCodes) {
-      const codeOptions = validationResult.relatedCodes.slice(0, 10);
-      const codeList = codeOptions.map((code, index) => 
-        `${index + 1}. ${code.hts_code} - ${code.description}
-   Full: ${code.full_description}
-   Context: ${code.context_path}`
-      ).join('\n\n');
-      
-      correctionPrompt = `VALIDATION FAILED for your classification.
-
-ORIGINAL CLASSIFICATION: ${invalidCode}
-VALIDATION ERROR: ${validationResult.validationData.error}
-
-ANALYSIS: Your subheading classification (${validationResult.validationData.subheading_analysis?.subheading}) appears ${validationResult.validationData.subheading_analysis?.subheading_appears_correct ? 'CORRECT' : 'INCORRECT'}.
-
-${validationResult.validationData.suggestion_context}
-
-VALID HTS CODES UNDER YOUR CHOSEN SUBHEADING:
-${codeList}
-
-Please select the most appropriate HTS code from the above official options and provide your corrected classification using the same JSON schema.`;
-    } else {
-      correctionPrompt = `VALIDATION FAILED for your classification.
-
-ORIGINAL CLASSIFICATION: ${invalidCode}
-VALIDATION ERROR: ${validationResult.validationData.error}
-
-Please provide a corrected 10-digit US HTS code that exists in the official database.
-
-Requirements:
-- Must be exactly 10 digits in format XXXX.XX.XX.XX
-- Must exist in the official HTS database
-- Provide your corrected classification using the same JSON schema`;
-    }
-
-    const result = await openaiService.continueClassification(responseId, correctionPrompt);
-    return result;
-  } catch (error) {
-    console.error('Error requesting correction:', error);
-    throw error;
-  }
-}
-
+/**
+ * Start a new classification process
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
 async function startClassification(req, res) {
-  const startTime = Date.now();
-  
   try {
     const { productDescription } = req.body;
     
-    console.log('\n🚀 NEW CLASSIFICATION REQUEST');
-    console.log('📝 Product length:', productDescription?.length || 0, 'characters');
+    console.log('DEBUG CONTROLLER: Starting classification with body:', JSON.stringify(req.body, null, 2));
     
-    if (!productDescription || productDescription.trim().length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Product description is required',
-        code: 'MISSING_DESCRIPTION'
-      });
+    if (!productDescription) {
+      return res.status(400).json({ error: 'Product description is required' });
     }
     
-    console.log('🔧 Starting OpenAI classification...');
+    console.log('DEBUG CONTROLLER: Calling htsValidationService.classifyWithValidation'); // ✅ CHANGED: Use validation service
     
-    const result = await openaiService.startClassification(productDescription);
+    // ✅ CHANGED: Use validation service instead of direct openai service
+    const result = await htsValidationService.classifyWithValidation(productDescription);
     
-    console.log('✅ OpenAI classification completed');
-    console.log('📊 Response type:', result.response?.responseType);
+    console.log('DEBUG CONTROLLER: Result from htsValidationService:', JSON.stringify(result, null, 2));
     
-    // ✅ Handle error responses from AI
-    if (result.response?.responseType === 'error') {
-      const duration = Date.now() - startTime;
-      return res.status(500).json({
-        success: false,
-        error: 'AI response error',
-        details: result.response.message,
-        code: 'AI_ERROR',
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms
-        },
-        timestamp: new Date().toISOString()
-      });
-    }
+    // Generate a session ID
+    const sessionId = Date.now().toString();
     
-    // Handle response based on type
-    if (result.response?.responseType === 'classification') {
-      const htsCode = result.response.htsCode;
-      console.log('🔍 Validating HTS code:', htsCode);
-      
-      const validation = await validateHtsCode(htsCode);
-      
-      if (validation.isValid) {
-        const duration = Date.now() - startTime;
-        
-        return res.status(200).json({
-          success: true,
-          type: 'result',
-          response_id: result.response_id,
-          ...result.response,
-          validation: {
-            ...result.response.validation,
-            database_confirmed: "✅ Validated in official database",
-            validation_details: validation.details
-          },
-          performance: { 
-            duration,
-            openai_time_ms: result.response_time_ms
-          },
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log('❌ Validation failed, requesting correction...');
-        const correctionResult = await requestCorrection(result.response_id, htsCode, validation);
-        const duration = Date.now() - startTime;
-        
-        return res.status(200).json({
-          success: true,
-          type: correctionResult.response?.responseType === 'classification' ? 'result' : 'question',
-          response_id: correctionResult.response_id,
-          ...correctionResult.response,
-          validation_attempted: {
-            original_code: htsCode,
-            validation_result: validation.message,
-            correction_requested: true,
-            alternatives_found: validation.hasAlternatives
-          },
-          performance: { 
-            duration,
-            openai_time_ms: result.response_time_ms + (correctionResult.response_time_ms || 0)
-          },
-          timestamp: new Date().toISOString()
-        });
-      }
-    } else if (result.response?.responseType === 'question') { // ✅ Updated from 'reasoning_question'
-      const duration = Date.now() - startTime;
+    // Store minimal session data
+    sessions[sessionId] = {
+      productDescription,
+      lastResponseId: result.response_id
+    };
+    
+    // ✅ SAME RESPONSE HANDLING AS BEFORE
+    if (typeof result.response === 'object' && result.response.responseType) {
+      const responseForUI = {
+        ...result.response,
+        type: result.response.responseType === 'classification' ? 'result' : result.response.responseType
+      };
       
       return res.status(200).json({
-        success: true,
-        type: 'question',
-        response_id: result.response_id,
-        ...result.response,
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms
-        },
-        timestamp: new Date().toISOString()
+        sessionId,
+        ...responseForUI
       });
     } else {
-      const duration = Date.now() - startTime;
+      console.error('Unexpected response format:', result.response);
       return res.status(500).json({ 
-        success: false,
-        error: 'Unexpected response format from AI',
-        code: 'INVALID_RESPONSE_FORMAT',
-        received_type: result.response?.responseType,
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms || 0
-        },
-        timestamp: new Date().toISOString()
+        error: 'Unexpected response format from OpenAI',
+        details: 'The response did not contain the expected structured data.'
       });
     }
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`❌ Classification failed in ${duration}ms:`, error);
-    
-    return res.status(500).json({ 
-      success: false,
-      error: 'Failed to start classification', 
-      code: 'CLASSIFICATION_ERROR',
-      message: error.message,
-      performance: { duration },
-      timestamp: new Date().toISOString()
-    });
+    console.error('Error starting classification:', error);
+    return res.status(500).json({ error: 'Failed to start classification', message: error.message });
   }
 }
 
+/**
+ * Continue an existing classification process with user selection
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
 async function continueClassification(req, res) {
-  const startTime = Date.now();
-  
   try {
-    const { response_id, sessionId, selection } = req.body;
-    const actualResponseId = response_id || sessionId;
+    const { sessionId, selection } = req.body; // ✅ SAME SESSIONID HANDLING
     
-    // ✅ ADD DEBUG LOGGING
-    console.log('\n🔄 CONTINUE CLASSIFICATION REQUEST');
-    console.log('📦 Request body:', JSON.stringify(req.body, null, 2));
-    console.log('🔗 response_id:', response_id);
-    console.log('🔗 sessionId:', sessionId);
-    console.log('🔗 actualResponseId:', actualResponseId);
-    console.log('💬 selection:', selection);
+    console.log('DEBUG CONTROLLER: Continuing classification with body:', JSON.stringify(req.body, null, 2));
     
-    if (!actualResponseId || !selection) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Response ID and selection are required',
-        code: 'MISSING_PARAMETERS',
-        received: { response_id, sessionId, selection }
-      });
+    if (!sessionId || !selection) {
+      return res.status(400).json({ error: 'Session ID and selection are required' });
     }
     
-    console.log('🔧 Continuing AI classification...');
-    
-    const result = await openaiService.continueClassification(actualResponseId, selection);
-    
-    console.log('✅ Continue classification completed');
-    console.log('📊 Response type:', result.response?.responseType);
-    
-    // ✅ Handle error responses from AI
-    if (result.response?.responseType === 'error') {
-      const duration = Date.now() - startTime;
-      return res.status(500).json({
-        success: false,
-        error: 'AI response error',
-        details: result.response.message,
-        code: 'AI_ERROR',
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms
-        },
-        timestamp: new Date().toISOString()
-      });
+    // ✅ SAME SESSION CHECK
+    if (!sessions[sessionId]) {
+      return res.status(404).json({ error: 'Session not found' });
     }
     
-    // Handle response (same logic as start)
-    if (result.response?.responseType === 'classification') {
-      const htsCode = result.response.htsCode;
-      console.log('🔍 Validating HTS code:', htsCode);
-      
-      const validation = await validateHtsCode(htsCode);
-      
-      if (validation.isValid) {
-        const duration = Date.now() - startTime;
-        
-        return res.status(200).json({
-          success: true,
-          type: 'result',
-          response_id: result.response_id,
-          ...result.response,
-          validation: {
-            ...result.response.validation,
-            database_confirmed: "✅ Validated in official database",
-            validation_details: validation.details
-          },
-          performance: { 
-            duration,
-            openai_time_ms: result.response_time_ms
-          },
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log('❌ Validation failed, requesting correction...');
-        const correctionResult = await requestCorrection(result.response_id, htsCode, validation);
-        const duration = Date.now() - startTime;
-        
-        return res.status(200).json({
-          success: true,
-          type: correctionResult.response?.responseType === 'classification' ? 'result' : 'question',
-          response_id: correctionResult.response_id,
-          ...correctionResult.response,
-          validation_attempted: {
-            original_code: htsCode,
-            validation_result: validation.message,
-            correction_requested: true,
-            alternatives_found: validation.hasAlternatives
-          },
-          performance: { 
-            duration,
-            openai_time_ms: result.response_time_ms + (correctionResult.response_time_ms || 0)
-          },
-          timestamp: new Date().toISOString()
-        });
-      }
-    } else if (result.response?.responseType === 'question') { // ✅ Updated from 'reasoning_question'
-      const duration = Date.now() - startTime;
+    console.log('DEBUG CONTROLLER: Calling htsValidationService.continueWithValidation'); // ✅ CHANGED: Use validation service
+    
+    // ✅ CHANGED: Use validation service instead of direct openai service
+    const result = await htsValidationService.continueWithValidation(
+      sessions[sessionId].lastResponseId,
+      selection
+    );
+    
+    console.log('DEBUG CONTROLLER: Result from continueWithValidation:', JSON.stringify(result, null, 2));
+    
+    // ✅ SAME SESSION UPDATE
+    sessions[sessionId].lastResponseId = result.response_id;
+    
+    // ✅ SAME RESPONSE HANDLING
+    if (typeof result.response === 'object' && result.response.responseType) {
+      const responseForUI = {
+        ...result.response,
+        type: result.response.responseType === 'classification' ? 'result' : result.response.responseType
+      };
       
       return res.status(200).json({
-        success: true,
-        type: 'question',
-        response_id: result.response_id,
-        ...result.response,
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms
-        },
-        timestamp: new Date().toISOString()
+        sessionId,
+        ...responseForUI
       });
     } else {
-      const duration = Date.now() - startTime;
+      console.error('Unexpected response format:', result.response);
       return res.status(500).json({ 
-        success: false,
-        error: 'Unexpected response format from AI',
-        code: 'INVALID_RESPONSE_FORMAT',
-        received_type: result.response?.responseType,
-        performance: { 
-          duration,
-          openai_time_ms: result.response_time_ms || 0
-        },
-        timestamp: new Date().toISOString()
+        error: 'Unexpected response format from OpenAI',
+        details: 'The response did not contain the expected structured data.'
       });
     }
   } catch (error) {
-    const duration = Date.now() - startTime;
-    console.error(`❌ Continue classification failed in ${duration}ms:`, error);
+    console.error('Error continuing classification:', error);
+    return res.status(500).json({ error: 'Failed to continue classification', message: error.message });
+  }
+}
+
+/**
+ * Get the current status of a classification session
+ * @param {Object} req - Express request object
+ * @param {Object} res - Express response object
+ */
+async function getSessionStatus(req, res) {
+  try {
+    const { sessionId } = req.params;
     
-    return res.status(500).json({ 
-      success: false,
-      error: 'Failed to continue classification', 
-      code: 'CONTINUE_ERROR',
-      message: error.message,
-      performance: { duration },
-      timestamp: new Date().toISOString()
+    console.log('DEBUG CONTROLLER: Getting session status for sessionId:', sessionId);
+    
+    if (!sessionId) {
+      return res.status(400).json({ error: 'Session ID is required' });
+    }
+    
+    // Check if the session exists
+    if (!sessions[sessionId]) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    
+    return res.status(200).json({
+      sessionId,
+      productDescription: sessions[sessionId].productDescription,
+      hasActiveConversation: !!sessions[sessionId].lastResponseId
     });
+  } catch (error) {
+    console.error('Error getting session status:', error);
+    return res.status(500).json({ error: 'Failed to get session status', message: error.message });
   }
 }
 
 module.exports = {
   startClassification,
-  continueClassification
+  continueClassification,
+  getSessionStatus
 };
